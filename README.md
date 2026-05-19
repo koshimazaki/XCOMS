@@ -32,12 +32,14 @@ colour-keyed profile so you can see at a glance which review is which.
 Output streams to disk in `.agent-handoff/` and the caller blocks on a
 sentinel file until the verdict is ready.
 
-**Why this exists.** SIDKIT is real-time embedded C++ on Teensy 4.1 +
-4-bit greyscale OLED + custom PCB. Audio-ISR safety, FASTRUN coverage,
-KiCad audit-report freshness, and SysEx 7-bit-byte constraints are
-mistakes you only catch if you read the code *without* the builder's
-"trust me" voice in your head. Fresh-context review is the cheapest way
-to get that voice out of the room.
+**Why this exists.** An agent that just wrote code is the worst
+reviewer of that code — its context window is saturated with the
+reasoning that produced it, and the builder's "trust me" voice carries
+straight into the review. A second agent with a *fresh context*,
+reading the same diff as a stranger, doesn't hear that voice and
+catches the bias the builder couldn't see. That's the whole idea:
+separate contexts, separate biases. `xreview` spawns the reviewer in
+its own terminal so the two never mix.
 
 The framework is reviewer-agnostic and language-agnostic — only the
 *prompts* are domain-specific, and they live in `prompts/` so you can
