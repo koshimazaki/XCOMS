@@ -19,31 +19,22 @@
 # codex-claude-review (`xreview`)
 
 > A cross-platform, cross-agent fresh-context code reviewer.
-> Built for [SIDKIT](https://sidkit.org) firmware + PCB review;
-> generalizable to any git repo and any language.
 
-Hands the current git diff to **Codex** (default, `gpt-5.5` xhigh) or
-**Claude** (`--effort max`) for a *fresh-context* review — the reviewer
-hasn't seen the builder's conversation, so it catches what the
-programmer's confirmation bias missed.
+`xreview` hands the current git diff to a second agent — Codex
+(default, `gpt-5.5` xhigh) or Claude (`--effort max`) — running in a
+fresh context. Because the reviewer has not been exposed to the
+builder's reasoning, the builder's confirmation bias does not carry
+into the review, and genuine issues surface that a self-review would
+otherwise miss.
 
-The reviewer spawns in a **separate terminal window** with a labelled,
-colour-keyed profile so you can see at a glance which review is which.
-Output streams to disk in `.agent-handoff/` and the caller blocks on a
-sentinel file until the verdict is ready.
+The reviewer spawns in a separate terminal window with a labelled
+profile, streams output to `.agent-handoff/`, and signals completion
+via a sentinel file. The caller blocks until the verdict is ready.
 
-**Why this exists.** An agent that just wrote code is the worst
-reviewer of that code — its context window is saturated with the
-reasoning that produced it, and the builder's "trust me" voice carries
-straight into the review. A second agent with a *fresh context*,
-reading the same diff as a stranger, doesn't hear that voice and
-catches the bias the builder couldn't see. That's the whole idea:
-separate contexts, separate biases. `xreview` spawns the reviewer in
-its own terminal so the two never mix.
-
-The framework is reviewer-agnostic and language-agnostic — only the
-*prompts* are domain-specific, and they live in `prompts/` so you can
-fork them for your stack.
+Made for [SIDKIT](https://github.com/sidkit-org) — an AI-native
+audio-game console — and extendable to any project, any language.
+See [`docs/documentation.md`](docs/documentation.md) for the full
+reference.
 
 ## Install
 
