@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+# xreview — cross-agent fresh-context code review
+# https://github.com/koshimazaki/Codex-x-Claude-Review-System
+#
+# Hands the current git diff to Codex (default) or Claude for a fresh-
+# context review, spawned in a separate terminal window with a titled,
+# colour-keyed profile. Works on macOS, Linux, and Windows (Git Bash/WSL).
+#
+# Usage:
+#   xreview [scope] [mode] [prompt-override]
+#
+# Scope:
+#   branch           git diff <base>...HEAD (default; base = $REVIEW_BASE or main)
+#   commit           git diff HEAD~1..HEAD
+#   staged           git diff --cached
+#   range:A..B       arbitrary range
+#   <sha>            6–40 hex chars → git diff SHA^..SHA
+#   <path>           anything else → git diff HEAD -- <path>
+#
+# Mode (default: lite for small scopes, deep for branch/path):
+#   lite             ~500-word output, fast (20 min cap)
+#   deep             full audit + tool use (50 min cap)
+#   security         OWASP/supply-chain focus (40 min cap)
+#
+# Environment:
+#   REVIEW_BASE        base branch for `branch` scope (default: main)
+#   REVIEW_DIFF_CAP    max diff lines fed to reviewer (default: 3000)
+#   REVIEW_REVIEWER    codex (default) | claude
+#   REVIEW_PROMPTS_DIR override prompt directory (default: alongside script)
+#   REVIEW_HANDOFF_DIR override handoff dir (default: ./.agent-handoff)
+#
+# Exit codes:
+#   0  ok
+#   2  bad arguments / missing git
+#   3  reviewer CLI not found
+#   4  filesystem error (chmod, write)
+#   5  terminal spawn failed
+#   6  reviewer timed out
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Resolve script directory (for finding bundled prompts)
+# ---------------------------------------------------------------------------
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -h "$SCRIPT_PATH" ]; do
+  DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+PROMPTS_DIR="${REVIEW_PROMPTS_DIR:-$SCRIPT_DIR/prompts}"
+
+# ---------------------------------------------------------------------------
+# Repo + args
+# ---------------------------------------------------------------------------
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "ERR: not inside a git repo" >&2; exit 2; }
+cd "$REPO"
+
+SCOPE_ARG="${1:-branch}"
+MODE_ARG="${2:-}"
+PROMPT_OVERRIDE="${3:-}"
+
+# ---------------------------------------------------------------------------
+# Help — must run before scope resolution so `xreview --help` doesn't fall
+# through to the path-scope case.
+# ---------------------------------------------------------------------------
+case "$SCOPE_ARG" in
+  -h|--help|help)
+    cat <<'HELP'
+xreview — cross-agent fresh-context code review
+
+USAGE
+  xreview [scope] [mode] [prompt-override]
+
+SCOPE
+  branch             git diff $REVIEW_BASE...HEAD  (default; base = main)
+  commit             git diff HEAD~1..HEAD
+  staged             git diff --cached
+  range:A..B         arbitrary range, e.g. range:f90a832^..b022db9
+  <sha>              6-40 hex chars -> git diff <sha>^..<sha>
+  <path>             anything else -> git diff HEAD -- <path>
+
+MODE (default: lite for small scopes, deep for branch/path)
+  lite               ~500-word HIGH-only output           (20 min cap)
+  deep               full risk register + tool use         (50 min cap)
+  security           OWASP / supply-chain / secrets        (40 min cap)
+  firmware-c         embedded C/C++ — FASTRUN / ISR        (50 min cap)
+  pcb                KiCad / schematic / DRC / audit       (40 min cap)
+  <custom>           any prompts/<custom>.md you drop in
+
+ENVIRONMENT
+  REVIEW_BASE          default main         base branch for `branch` scope
+  REVIEW_DIFF_CAP      default 3000         max diff lines fed to reviewer
+  REVIEW_REVIEWER      default codex        codex | claude
+  REVIEW_PROMPTS_DIR   default <script>/prompts
+  REVIEW_HANDOFF_DIR   default <repo>/.agent-handoff
+
+EXIT CODES
+  0  OK (verdict produced)
+  2  Bad arguments / not in a git repo
+  3  Reviewer CLI not found
+  4  Filesystem error
+  5  Terminal spawn failed
+  6  Reviewer timed out
+  7  Reviewer exited non-zero or produced no verdict
+
+EXAMPLES
+  xreview commit
+  xreview b022db9 firmware-c
+  xreview range:HEAD~4..HEAD deep
+  xreview path/to/dir security
+  REVIEW_REVIEWER=claude xreview branch lite
+HELP
+    exit 0 ;;
+esac
+TS="$(date +%Y-%m-%d-%H%M%S)"
+HANDOFF="${REVIEW_HANDOFF_DIR:-$REPO/.agent-handoff}"
+mkdir -p "$HANDOFF" || { echo "ERR: cannot create $HANDOFF" >&2; exit 4; }
+
+REVIEWER="${REVIEW_REVIEWER:-codex}"
+case "$REVIEWER" in codex|claude) ;; *)
+  echo "ERR: REVIEW_REVIEWER must be 'codex' or 'claude'" >&2; exit 2;;
+esac
+
+# ---------------------------------------------------------------------------
+# Scope resolution — DIFF_ARGS is an array fed to `git "${DIFF_ARGS[@]}"` so
+# no shell injection is possible from user-supplied scope strings (paths
+# with spaces / shell metachars / `$(cmd)` are inert).
+# ---------------------------------------------------------------------------
+case "$SCOPE_ARG" in
+  branch)
+    BASE="${REVIEW_BASE:-main}"
+    DIFF_ARGS=(diff "${BASE}...HEAD")
+    SCOPE_LABEL="branch (${BASE}...HEAD)"
+    SCOPE_TAG="branch"
+    ;;
+  commit)
+    DIFF_ARGS=(diff "HEAD~1..HEAD")
+    SCOPE_LABEL="last commit (HEAD~1..HEAD)"
+    SCOPE_TAG="commit"
+    ;;
+  staged)
+    DIFF_ARGS=(diff --cached)
+    SCOPE_LABEL="staged changes"
+    SCOPE_TAG="staged"
+    ;;
+  range:*)
+    RANGE="${SCOPE_ARG#range:}"
+    # Validate range — must look like A..B or A...B with rev-parseable ends
+    if ! echo "$RANGE" | grep -Eq '^[^[:space:]]+\.\.\.?[^[:space:]]+$'; then
+      echo "ERR: bad range '$RANGE' — expected A..B or A...B" >&2; exit 2; fi
+    DIFF_ARGS=(diff "$RANGE")
+    SCOPE_LABEL="range $RANGE"
+    SCOPE_TAG="range"
+    ;;
+  *)
+    if echo "$SCOPE_ARG" | grep -Eq '^[0-9a-fA-F]{6,40}$' && \
+       git rev-parse --verify --quiet "${SCOPE_ARG}^{commit}" >/dev/null; then
+      DIFF_ARGS=(diff "${SCOPE_ARG}^..${SCOPE_ARG}")
+      SCOPE_LABEL="commit ${SCOPE_ARG}"
+      SCOPE_TAG="sha"
+    else
+      # Path scope — `--` separator forces git to treat it as a pathspec
+      # regardless of content, neutralising any flag-injection attempt.
+      DIFF_ARGS=(diff HEAD -- "$SCOPE_ARG")
+      SCOPE_LABEL="path: $SCOPE_ARG"
+      SCOPE_TAG="path"
+    fi
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Mode resolution — lite for small scopes when not specified
+# ---------------------------------------------------------------------------
+if [ -z "$MODE_ARG" ]; then
+  case "$SCOPE_TAG" in
+    commit|sha|staged) MODE="lite" ;;
+    *)                  MODE="deep" ;;
+  esac
+else
+  MODE="$MODE_ARG"
+fi
+case "$MODE" in lite|deep|security|firmware-c|pcb) ;; *)
+  # Anything else is allowed if a prompts/<mode>.md exists — supports
+  # user-defined modes like 'rust-async', 'k8s-yaml', etc.
+  if [ ! -r "$PROMPTS_DIR/${MODE}.md" ]; then
+    echo "ERR: unknown mode '$MODE' (built-in: lite|deep|security|firmware-c|pcb)" >&2
+    echo "      or drop a prompts/${MODE}.md to define a custom mode" >&2
+    exit 2
+  fi
+  ;;
+esac
+
+IN="$HANDOFF/${TS}-${MODE}-input.md"
+OUT="$HANDOFF/${TS}-${MODE}-output.md"
+
+# ---------------------------------------------------------------------------
+# Mode prompt — load from prompts/<mode>.md, fall back to inline default
+# ---------------------------------------------------------------------------
+load_prompt() {
+  local mode="$1"
+  local file="$PROMPTS_DIR/${mode}.md"
+  if [ -r "$file" ]; then cat "$file"; return; fi
+  # Inline fallbacks for every built-in mode so the tool still works when
+  # prompts/ is missing (e.g. after a botched install that only copied the
+  # binary). Custom modes still require a prompts/<mode>.md file — handled
+  # by the mode-validation case earlier.
+  case "$mode" in
+    lite)
+      echo "Fresh-context review — LITE. Lead with HIGH-severity findings only. Output max ~500 words. For each finding: one line + file:line + mechanism + fix sketch. Skip nits. End with: ## Verdict: SHIP | MERGE-WITH-FOLLOWUPS | NEEDS-CHANGES." ;;
+    deep)
+      echo "Fresh-context review — DEEP. Produce a prioritized HIGH/MEDIUM/LOW risk register. Each finding: file:line + mechanism + fix sketch. Verify suspicious patterns by reading the actual code. End with: ## Verdict: SHIP | MERGE-WITH-FOLLOWUPS | NEEDS-CHANGES." ;;
+    security)
+      echo "Fresh-context SECURITY review. OWASP top-10, supply-chain (lockfile drift, transitive vulns), secrets/credentials, auth boundaries, injection (SQL/cmd/path/SSRF), deserialization, races. Each finding: severity + file:line + exploit sketch + fix. End with: ## Verdict: SAFE | NEEDS-HARDENING | BLOCKING." ;;
+    firmware-c)
+      echo "Fresh-context EMBEDDED C/C++ FIRMWARE review. Audit FASTRUN coverage on update()/process(), heap/blocking in audio ISRs, interrupt guards, CPU-budget compliance, hardware-pin/sample-rate constants, SysEx/MIDI 7-bit constraints, OLED page wiring, ODR violations from heavy library headers. End with: ## Verdict: SHIP | MERGE-WITH-FOLLOWUPS | NEEDS-CHANGES." ;;
+    pcb)
+      echo "Fresh-context PCB/SCHEMATIC review. Audit-report freshness (re-run live audit), net-label drift, phantom components, power-rail topology, hier-pin contracts, footprint pad numbering, DRC clearance, reference-design attribution. End with: ## Verdict: SHIP | MERGE-WITH-FOLLOWUPS | NEEDS-CHANGES." ;;
+  esac
+}
+DEFAULT_PROMPT="$(load_prompt "$MODE")"
+PROMPT="${PROMPT_OVERRIDE:-$DEFAULT_PROMPT}"
+
+# ---------------------------------------------------------------------------
+# Build input file
+# ---------------------------------------------------------------------------
+DIFF_CAP="${REVIEW_DIFF_CAP:-3000}"
+{
+  echo "# Code Review Request"
+  echo
+  echo "**Timestamp:** $TS"
+  echo "**Mode:** $MODE"
+  echo "**Reviewer:** $REVIEWER"
+  echo "**Scope:** $SCOPE_LABEL"
+  echo "**Repo:** $REPO"
+  echo "**Branch:** $(git rev-parse --abbrev-ref HEAD)"
+  echo "**HEAD:** $(git rev-parse --short HEAD)"
+  echo
+  echo "## Review prompt"
+  echo
+  echo "$PROMPT"
+  echo
+  echo "## Diff (capped at $DIFF_CAP lines)"
+  echo
+  echo '```diff'
+  # No eval — `git "${DIFF_ARGS[@]}"` is shell-injection-proof regardless of
+  # how messy $SCOPE_ARG was (paths with spaces, $(cmd), backticks all inert).
+  git "${DIFF_ARGS[@]}" 2>/dev/null | head -"$DIFF_CAP" || true
+  echo '```'
+} > "$IN"
+
+if [ ! -s "$IN" ] || ! grep -q '^diff ' "$IN"; then
+  echo "No diff content for scope '$SCOPE_LABEL'. Nothing to review."
+  echo "Input file: $IN"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve reviewer binary
+# ---------------------------------------------------------------------------
+if [ "$REVIEWER" = "codex" ]; then
+  if command -v codex >/dev/null 2>&1; then BIN="codex"
+  elif [ -x "$HOME/bin/codex" ]; then BIN="$HOME/bin/codex"
+  elif [ -x "/Applications/Codex.app/Contents/Resources/codex" ]; then
+    BIN="/Applications/Codex.app/Contents/Resources/codex"
+  else
+    echo "ERR: codex CLI not found. Install Codex.app or:" >&2
+    echo "  ln -s /Applications/Codex.app/Contents/Resources/codex ~/bin/codex" >&2
+    exit 3
+  fi
+  REVIEWER_CMD=("$BIN" exec -C "$REPO" -m gpt-5.5
+    -c model_reasoning_effort=xhigh -s danger-full-access)
+else
+  if command -v claude >/dev/null 2>&1; then BIN="claude"
+  else echo "ERR: claude CLI not found" >&2; exit 3; fi
+  REVIEWER_CMD=("$BIN" --effort max -p)
+fi
+
+# ---------------------------------------------------------------------------
+# Mode → two-word title + macOS Terminal.app profile
+# Title format: "<TYPE> REVIEW · <scope>" — readable at a glance in the
+# Dock and in `wmctrl` / Mission Control. Built-in modes have hardcoded
+# labels; custom modes derive a label from the mode name (e.g.
+# rust-async → "RUST-ASYNC REVIEW").
+# ---------------------------------------------------------------------------
+case "$MODE" in
+  lite)       TITLE_TYPE="LITE REVIEW";       MAC_PROFILE="Grass" ;;
+  deep)       TITLE_TYPE="DEEP REVIEW";       MAC_PROFILE="Homebrew" ;;
+  security)   TITLE_TYPE="SECURITY AUDIT";    MAC_PROFILE="Red Sands" ;;
+  firmware-c) TITLE_TYPE="FIRMWARE REVIEW";   MAC_PROFILE="Homebrew" ;;
+  pcb)        TITLE_TYPE="PCB REVIEW";        MAC_PROFILE="Pro" ;;
+  *)          TITLE_TYPE="$(echo "$MODE" | tr 'a-z' 'A-Z') REVIEW"
+              MAC_PROFILE="Basic" ;;
+esac
+TITLE="$TITLE_TYPE · $SCOPE_LABEL"
+
+ABS_IN="$IN"
+ABS_OUT="$OUT"
+RUNNER="$HANDOFF/${TS}-${MODE}-runner.sh"
+SENTINEL="$ABS_OUT.done"
+RC_FILE="$ABS_OUT.rc"
+
+# Serialise the reviewer command into the runner. Bash arrays don't survive
+# heredocs well, so expand them to a printf-quoted string here.
+REVIEWER_CMD_STR=$(printf '%q ' "${REVIEWER_CMD[@]}")
+
+cat > "$RUNNER" <<RUNNER_EOF
+#!/usr/bin/env bash
+cd "$REPO"
+# OSC 0 — set window+icon title (universal across modern terminals)
+printf '\033]0;%s\007' "$TITLE"
+PROMPT="\$(cat '$ABS_IN')"
+$REVIEWER_CMD_STR "\$PROMPT" 2>&1 | tee '$ABS_OUT'
+RC=\${PIPESTATUS[0]}
+# Persist the reviewer's exit code so the parent can propagate it.
+# The sentinel is created LAST so the parent never reads a partial RC file.
+echo "\$RC" > '$RC_FILE'
+echo
+echo "=== Reviewer exited (\$RC). Press any key to close. ==="
+touch '$SENTINEL'
+read -n 1
+RUNNER_EOF
+chmod +x "$RUNNER" || { echo "ERR: chmod on $RUNNER failed" >&2; exit 4; }
+
+echo "=== xreview handoff ==="
+echo "Reviewer: $REVIEWER ($BIN)"
+echo "Scope:    $SCOPE_LABEL"
+echo "Mode:     $MODE"
+echo "Input:    $IN"
+echo "Output:   $OUT"
+echo
+
+# ---------------------------------------------------------------------------
+# Platform-specific spawn
+# ---------------------------------------------------------------------------
+spawn_terminal() {
+  local runner="$1"
+  case "$(uname -s)" in
+    Darwin)
+      if ! osascript >/dev/null 2>&1 <<APPLESCRIPT
+tell application "Terminal"
+  activate
+  do script "$runner"
+  set custom title of front window to "$TITLE"
+  try
+    set current settings of front window to settings set "$MAC_PROFILE"
+  end try
+end tell
+APPLESCRIPT
+      then echo "ERR: osascript spawn failed" >&2; return 1; fi
+      ;;
+    Linux)
+      if   command -v gnome-terminal >/dev/null 2>&1; then
+        gnome-terminal --title="$TITLE" -- bash -c "$runner; exec bash" &
+      elif command -v konsole >/dev/null 2>&1; then
+        konsole --new-tab -p "tabtitle=$TITLE" -e bash -c "$runner; exec bash" &
+      elif command -v wezterm >/dev/null 2>&1; then
+        wezterm cli spawn --new-window -- bash -c "$runner" &
+      elif command -v kitty >/dev/null 2>&1; then
+        kitty --title "$TITLE" bash -c "$runner; exec bash" &
+      elif command -v alacritty >/dev/null 2>&1; then
+        alacritty --title "$TITLE" -e bash -c "$runner" &
+      elif command -v xterm >/dev/null 2>&1; then
+        xterm -T "$TITLE" -e bash -c "$runner; exec bash" &
+      elif [ -n "${TMUX:-}" ]; then
+        tmux new-window -n "$TITLE" "bash -c '$runner'"
+      else
+        echo "WARN: no GUI terminal found; running inline" >&2
+        bash "$runner"
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      if command -v wt.exe >/dev/null 2>&1; then
+        wt.exe new-tab --title "$TITLE" bash -c "$runner; exec bash" &
+      elif command -v cmd.exe >/dev/null 2>&1; then
+        cmd.exe /c start "$TITLE" bash -c "$runner; pause" &
+      else
+        echo "WARN: no Windows terminal launcher found; running inline" >&2
+        bash "$runner"
+      fi
+      ;;
+    *)
+      echo "WARN: unknown platform $(uname -s); running inline" >&2
+      bash "$runner"
+      ;;
+  esac
+}
+
+spawn_terminal "$RUNNER" || {
+  echo "ERR: terminal spawn failed. Manually run: bash $RUNNER" >&2
+  exit 5
+}
+
+echo "Reviewer spawned. Title: $TITLE"
+echo "Polling sentinel: $SENTINEL"
+
+# ---------------------------------------------------------------------------
+# Wait for completion
+# ---------------------------------------------------------------------------
+case "$MODE" in
+  lite)        TIMEOUT_SEC=1200 ;;   # 20 min
+  deep)        TIMEOUT_SEC=3000 ;;   # 50 min
+  security)    TIMEOUT_SEC=2400 ;;   # 40 min
+  firmware-c)  TIMEOUT_SEC=3000 ;;   # 50 min — pio audits can be slow
+  pcb)         TIMEOUT_SEC=2400 ;;   # 40 min
+  *)           TIMEOUT_SEC=2400 ;;   # custom-mode default
+esac
+
+WAITED=0
+while [ ! -f "$SENTINEL" ]; do
+  sleep 5
+  WAITED=$((WAITED + 5))
+  if [ -s "$OUT" ]; then
+    LINES=$(wc -l < "$OUT" | tr -d ' ')
+    echo "  [${WAITED}s] $LINES lines so far..."
+  fi
+  if [ "$WAITED" -gt "$TIMEOUT_SEC" ]; then
+    echo "ERR: timeout after $((TIMEOUT_SEC/60)) min" >&2
+    echo "      Runner: $RUNNER" >&2
+    echo "      Output: $OUT" >&2
+    exit 6
+  fi
+done
+rm -f "$SENTINEL"
+
+# Read reviewer RC. Missing RC file = abnormal exit (terminal closed
+# before runner finished writing). Non-zero RC = reviewer crashed or
+# was killed.
+REVIEWER_RC=0
+if [ -r "$RC_FILE" ]; then
+  REVIEWER_RC="$(cat "$RC_FILE" 2>/dev/null || echo 1)"
+  rm -f "$RC_FILE"
+else
+  echo "WARN: reviewer RC file missing — treating as failure" >&2
+  REVIEWER_RC=1
+fi
+
+# ---------------------------------------------------------------------------
+# Surface verdict + propagate failure
+# ---------------------------------------------------------------------------
+echo
+echo "=== $REVIEWER review ($MODE) ==="
+if grep -q '^## Verdict' "$OUT"; then
+  awk '/^## Verdict/,EOF' "$OUT"
+  HAS_VERDICT=1
+else
+  tail -200 "$OUT"
+  HAS_VERDICT=0
+fi
+echo
+echo "=== Full review: $OUT ==="
+echo "Reviewer exit code: $REVIEWER_RC"
+
+# Exit code policy — caller (hook / CI) needs to know when the review
+# failed to produce a verdict OR the reviewer itself crashed. Pre-commit
+# hooks rely on this; without it the hook treats a crash as "passed".
+if [ "$REVIEWER_RC" -ne 0 ]; then
+  echo "ERR: reviewer exited non-zero ($REVIEWER_RC)" >&2
+  exit 7
+fi
+if [ "$HAS_VERDICT" -eq 0 ]; then
+  echo "ERR: reviewer produced no '## Verdict' section — incomplete review" >&2
+  exit 7
+fi
+exit 0

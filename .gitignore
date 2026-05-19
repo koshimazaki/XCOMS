@@ -1,0 +1,8 @@
+# Per-developer review artifacts — input/output/runner files are
+# regenerated on every invocation, never useful to share.
+.agent-handoff/
+
+# Editor / OS detritus
+.DS_Store
+*.swp
+*.swo
