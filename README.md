@@ -22,10 +22,11 @@
 
 `xreview` hands the current git diff to a second agent — Codex
 (default, `gpt-5.5` xhigh) or Claude (`--effort max`) — running in a
-fresh context. Because the reviewer has not been exposed to the
-builder's reasoning, the builder's confirmation bias does not carry
-into the review, and genuine issues surface that a self-review would
-otherwise miss.
+fresh context. The reviewer has not been exposed to the builder's
+reasoning, so confirmation bias does not carry into the review.
+Compared to re-prompting the original agent to audit its own work,
+pairing fresh context with a different agent shortens debug loops
+and reduces token spend.
 
 The reviewer spawns in a separate terminal window with a labelled
 profile, streams output to `.agent-handoff/`, and signals completion
