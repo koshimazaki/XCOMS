@@ -19,7 +19,7 @@
 # codex-claude-review (`xreview`)
 
 > A cross-platform, cross-agent fresh-context code reviewer.
-> Built for [SIDKIT](https://sidkit.pages.dev) firmware + PCB review;
+> Built for [SIDKIT](https://sidkit.org) firmware + PCB review;
 > generalizable to any git repo and any language.
 
 Hands the current git diff to **Codex** (default, `gpt-5.5` xhigh) or
@@ -133,7 +133,7 @@ side, then WebUI side after the firmware fix) that the implementer had
 already convinced themselves was correct. That's the value.
 
 Part of the [SIDKIT](https://github.com/sidkit-org) ecosystem
-([sidkit.pages.dev](https://sidkit.pages.dev)). If it helps your
+([sidkit.org](https://sidkit.org)). If it helps your
 project too, fork the prompts. If you build a prompt template for
 your stack, PR it back.
 
