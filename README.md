@@ -6,8 +6,7 @@
 ██╔╝ ██╗╚██████╗╚██████╔╝██║ ╚═╝ ██║███████║
 ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
 ░░░█ X Communications (XComs) █░░░
-░░ A small, portable protocol for communication between coding agents.
-░░ v0.2
+░░ A small, portable protocol for communication between coding agents ░░ v0.2
 ```
 
 # X Communications (XComs)
