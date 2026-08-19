@@ -1,6 +1,18 @@
-# X Communications (`XComs`)
+```text
+██╗  ██╗ ██████╗ ██████╗ ███╗   ███╗███████╗
+╚██╗██╔╝██╔════╝██╔═══██╗████╗ ████║██╔════╝
+ ╚███╔╝ ██║     ██║   ██║██╔████╔██║███████╗
+ ██╔██╗ ██║     ██║   ██║██║╚██╔╝██║╚════██║
+██╔╝ ██╗╚██████╗╚██████╔╝██║ ╚═╝ ██║███████║
+╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
+░░░█ X Communications (XComs) █░░░
+░░ A small, portable protocol for communication between coding agents.
+░░ v0.2
+```
 
-> A small, portable vocabulary for communication between coding agents.
+# X Communications (XComs)
+
+> A small, portable protocol for communication between coding agents.
 
 XComs separates the actions an agent takes from the transport that carries
 them. The same verbs can work across Codex, Claude Code, or another runtime
@@ -25,8 +37,8 @@ deliberately replaceable.
 ## Install `xreview`
 
 ```sh
-git clone https://github.com/koshimazaki/Codex-x-Claude-Review-System.git
-cd Codex-x-Claude-Review-System
+git clone https://github.com/koshimazaki/XCOMS.git
+cd XCOMS
 ./install.sh
 ```
 
