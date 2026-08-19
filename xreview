@@ -1,467 +1,797 @@
 #!/usr/bin/env bash
-# xreview — cross-agent fresh-context code review
-# https://github.com/koshimazaki/Codex-x-Claude-Review-System
-#
-# Hands the current git diff to Codex (default) or Claude for a fresh-
-# context review, spawned in a separate terminal window with a titled,
-# colour-keyed profile. Works on macOS, Linux, and Windows (Git Bash/WSL).
-#
-# Usage:
-#   xreview [scope] [mode] [prompt-override]
-#
-# Scope:
-#   branch           git diff <base>...HEAD (default; base = $REVIEW_BASE or main)
-#   commit           git diff HEAD~1..HEAD
-#   staged           git diff --cached
-#   range:A..B       arbitrary range
-#   <sha>            6–40 hex chars → git diff SHA^..SHA
-#   <path>           anything else → git diff HEAD -- <path>
-#
-# Mode (default: lite for small scopes, deep for branch/path):
-#   lite             ~500-word output, fast (20 min cap)
-#   deep             full audit + tool use (50 min cap)
-#   security         OWASP/supply-chain focus (40 min cap)
-#
-# Environment:
-#   REVIEW_BASE        base branch for `branch` scope (default: main)
-#   REVIEW_DIFF_CAP    max diff lines fed to reviewer (default: 3000)
-#   REVIEW_REVIEWER    codex (default) | claude
-#   REVIEW_PROMPTS_DIR override prompt directory (default: alongside script)
-#   REVIEW_HANDOFF_DIR override handoff dir (default: ./.agent-handoff)
-#
-# Exit codes:
-#   0  ok
-#   2  bad arguments / missing git
-#   3  reviewer CLI not found
-#   4  filesystem error (chmod, write)
-#   5  terminal spawn failed
-#   6  reviewer timed out
-
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Resolve script directory (for finding bundled prompts)
-# ---------------------------------------------------------------------------
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CLAUDE_MODEL="${XREVIEW_CLAUDE_MODEL:-opus}"
+CLAUDE_EFFORT="${XREVIEW_CLAUDE_EFFORT:-max}"
+CLAUDE_DISALLOWED_TOOLS="Edit,Write,NotebookEdit,Bash(git add:*),Bash(git checkout:*),Bash(git clean:*),Bash(git commit:*),Bash(git push:*),Bash(git reset:*),Bash(git restore:*),Bash(git stash:*),Bash(git switch:*)"
+
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-while [ -h "$SCRIPT_PATH" ]; do
-  DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+while [[ -h "$SCRIPT_PATH" ]]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
   SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
-  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$DIR/$SCRIPT_PATH"
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
-PROMPTS_DIR="${REVIEW_PROMPTS_DIR:-$SCRIPT_DIR/prompts}"
+BUNDLED_SKILL_PATH="$SCRIPT_DIR/skills/xreview/SKILL.md"
+GLOBAL_SKILL_PATH="$HOME/.agents/skills/xreview/SKILL.md"
 
-# ---------------------------------------------------------------------------
-# Repo + args
-# ---------------------------------------------------------------------------
-REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-  echo "ERR: not inside a git repo" >&2; exit 2; }
-cd "$REPO"
+mode="lite"
+scope=""
+pr=""
+dry_run=0
+headless=0
+mechanical=0
+declare -a passthrough=()
 
-SCOPE_ARG="${1:-branch}"
-MODE_ARG="${2:-}"
-PROMPT_OVERRIDE="${3:-}"
+usage() {
+  cat <<'EOF'
+Usage: xreview [target|--staged|--working|--pr N] [options] [paths...]
 
-# ---------------------------------------------------------------------------
-# Help — must run before scope resolution so `xreview --help` doesn't fall
-# through to the path-scope case.
-# ---------------------------------------------------------------------------
-case "$SCOPE_ARG" in
-  -h|--help|help)
-    cat <<'HELP'
-xreview — cross-agent fresh-context code review
+Opens a fresh code-review session for a local commit, range, dirty/staged diff,
+PR, or file scope. Default outside Codex: a visible `codex review` in a new
+Terminal window. Default inside a Codex shell: Claude reviewer for cross-agent
+checking. Use XREVIEW_ENGINE=codex or XREVIEW_ENGINE=claude to force either.
 
-USAGE
-  xreview [scope] [mode] [prompt-override]
+Options:
+  --mode MODE       Review mode. Global modes: lite, mid, deep, security, docs.
+                    Other modes are repo-specific and must be defined locally.
+  --scope VALUE     Named scope or focus label.
+  --pr VALUE        Review a GitHub PR number or URL with gh.
+  --staged          Review staged changes.
+  --working         Review unstaged working-tree changes.
+  --mechanical      Produce a Mechanical Test Contract instead of a bug review.
+  --test-contract   Alias for --mechanical.
+  --tests           Alias for --mechanical.
+  --headless        Run the review in-process (no window). Default spawns a
+                    visible Terminal window for the selected reviewer.
+  --dry-run         Print resolved launcher settings without starting the reviewer.
+  -v, --version     Show the launcher version.
+  -h, --help        Show this help.
 
-SCOPE
-  branch             git diff $REVIEW_BASE...HEAD  (default; base = main)
-  commit             git diff HEAD~1..HEAD
-  staged             git diff --cached
-  range:A..B         arbitrary range, e.g. range:f90a832^..b022db9
-  <sha>              6-40 hex chars -> git diff <sha>^..<sha>
-  <path>             anything else -> git diff HEAD -- <path>
+Examples:
+  xreview
+  xreview HEAD
+  xreview 709558d
+  xreview HEAD~3..HEAD
+  xreview --staged
+  xreview --pr 123
+  xreview HEAD --mechanical --mode lite
 
-MODE (default: lite for small scopes, deep for branch/path)
-  lite               ~500-word HIGH-only output           (20 min cap)
-  deep               full risk register + tool use         (50 min cap)
-  security           OWASP / supply-chain / secrets        (40 min cap)
-  firmware-c         embedded C/C++ — FASTRUN / ISR        (50 min cap)
-  pcb                KiCad / schematic / DRC / audit       (40 min cap)
-  <custom>           any prompts/<custom>.md you drop in
+Output:
+  Every run (windowed or --headless) is tee'd to a unique per-repo log with a
+  completion marker containing the reviewer exit status:
+    ${XREVIEW_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/xreview}/<repo>-<path-hash>-<run-id>.log
+    <log-path>.done
+  A <repo>-<path-hash>-latest.log symlink points at the newest run when the
+  platform permits symlinks.
 
-ENVIRONMENT
-  REVIEW_BASE          default main         base branch for `branch` scope
-  REVIEW_DIFF_CAP      default 3000         max diff lines fed to reviewer
-  REVIEW_REVIEWER      default codex        codex | claude
-  REVIEW_PROMPTS_DIR   default <script>/prompts
-  REVIEW_HANDOFF_DIR   default <repo>/.agent-handoff
-
-EXIT CODES
-  0  OK (verdict produced)
-  2  Bad arguments / not in a git repo
-  3  Reviewer CLI not found
-  4  Filesystem error
-  5  Terminal spawn failed
-  6  Reviewer timed out
-  7  Reviewer exited non-zero or produced no verdict
-
-EXAMPLES
-  xreview commit
-  xreview b022db9 firmware-c
-  xreview range:HEAD~4..HEAD deep
-  xreview path/to/dir security
-  REVIEW_REVIEWER=claude xreview branch lite
-HELP
-    exit 0 ;;
-esac
-TS="$(date +%Y-%m-%d-%H%M%S)"
-HANDOFF="${REVIEW_HANDOFF_DIR:-$REPO/.agent-handoff}"
-mkdir -p "$HANDOFF" || { echo "ERR: cannot create $HANDOFF" >&2; exit 4; }
-
-REVIEWER="${REVIEW_REVIEWER:-codex}"
-case "$REVIEWER" in codex|claude) ;; *)
-  echo "ERR: REVIEW_REVIEWER must be 'codex' or 'claude'" >&2; exit 2;;
-esac
-
-# ---------------------------------------------------------------------------
-# Scope resolution — DIFF_ARGS is an array fed to `git "${DIFF_ARGS[@]}"` so
-# no shell injection is possible from user-supplied scope strings (paths
-# with spaces / shell metachars / `$(cmd)` are inert).
-# ---------------------------------------------------------------------------
-case "$SCOPE_ARG" in
-  branch)
-    BASE="${REVIEW_BASE:-main}"
-    DIFF_ARGS=(diff "${BASE}...HEAD")
-    SCOPE_LABEL="branch (${BASE}...HEAD)"
-    SCOPE_TAG="branch"
-    ;;
-  commit)
-    DIFF_ARGS=(diff "HEAD~1..HEAD")
-    SCOPE_LABEL="last commit (HEAD~1..HEAD)"
-    SCOPE_TAG="commit"
-    ;;
-  staged)
-    DIFF_ARGS=(diff --cached)
-    SCOPE_LABEL="staged changes"
-    SCOPE_TAG="staged"
-    ;;
-  range:*)
-    RANGE="${SCOPE_ARG#range:}"
-    # Validate range — must look like A..B or A...B with rev-parseable ends
-    if ! echo "$RANGE" | grep -Eq '^[^[:space:]]+\.\.\.?[^[:space:]]+$'; then
-      echo "ERR: bad range '$RANGE' — expected A..B or A...B" >&2; exit 2; fi
-    DIFF_ARGS=(diff "$RANGE")
-    SCOPE_LABEL="range $RANGE"
-    SCOPE_TAG="range"
-    ;;
-  *)
-    if echo "$SCOPE_ARG" | grep -Eq '^[0-9a-fA-F]{6,40}$' && \
-       git rev-parse --verify --quiet "${SCOPE_ARG}^{commit}" >/dev/null; then
-      DIFF_ARGS=(diff "${SCOPE_ARG}^..${SCOPE_ARG}")
-      SCOPE_LABEL="commit ${SCOPE_ARG}"
-      SCOPE_TAG="sha"
-    else
-      # Path scope — `--` separator forces git to treat it as a pathspec
-      # regardless of content, neutralising any flag-injection attempt.
-      DIFF_ARGS=(diff HEAD -- "$SCOPE_ARG")
-      SCOPE_LABEL="path: $SCOPE_ARG"
-      SCOPE_TAG="path"
-    fi
-    ;;
-esac
-
-# ---------------------------------------------------------------------------
-# Mode resolution — lite for small scopes when not specified
-# ---------------------------------------------------------------------------
-if [ -z "$MODE_ARG" ]; then
-  case "$SCOPE_TAG" in
-    commit|sha|staged) MODE="lite" ;;
-    *)                  MODE="deep" ;;
-  esac
-else
-  MODE="$MODE_ARG"
-fi
-case "$MODE" in lite|deep|security|firmware-c|pcb) ;; *)
-  # Anything else is allowed if a prompts/<mode>.md exists — supports
-  # user-defined modes like 'rust-async', 'k8s-yaml', etc.
-  if [ ! -r "$PROMPTS_DIR/${MODE}.md" ]; then
-    echo "ERR: unknown mode '$MODE' (built-in: lite|deep|security|firmware-c|pcb)" >&2
-    echo "      or drop a prompts/${MODE}.md to define a custom mode" >&2
-    exit 2
-  fi
-  ;;
-esac
-
-IN="$HANDOFF/${TS}-${MODE}-input.md"
-OUT="$HANDOFF/${TS}-${MODE}-output.md"
-
-# ---------------------------------------------------------------------------
-# Mode prompt — load from prompts/<mode>.md, fall back to inline default
-# ---------------------------------------------------------------------------
-load_prompt() {
-  local mode="$1"
-  local file="$PROMPTS_DIR/${mode}.md"
-  if [ -r "$file" ]; then cat "$file"; return; fi
-  # Inline fallbacks for every built-in mode so the tool still works when
-  # prompts/ is missing (e.g. after a botched install that only copied the
-  # binary). Custom modes still require a prompts/<mode>.md file — handled
-  # by the mode-validation case earlier.
-  case "$mode" in
-    lite)
-      echo "Fresh-context review — LITE. Lead with HIGH-severity findings only. Output max ~500 words. For each finding: one line + file:line + mechanism + fix sketch. Skip nits. End with: ## Verdict: SHIP | MERGE-WITH-FOLLOWUPS | NEEDS-CHANGES." ;;
-    deep)
-      echo "Fresh-context review — DEEP. Produce a prioritized HIGH/MEDIUM/LOW risk register. Each finding: file:line + mechanism + fix sketch. Verify suspicious patterns by reading the actual code. End with: ## Verdict: SHIP | MERGE-WITH-FOLLOWUPS | NEEDS-CHANGES." ;;
-    security)
-      echo "Fresh-context SECURITY review. OWASP top-10, supply-chain (lockfile drift, transitive vulns), secrets/credentials, auth boundaries, injection (SQL/cmd/path/SSRF), deserialization, races. Each finding: severity + file:line + exploit sketch + fix. End with: ## Verdict: SAFE | NEEDS-HARDENING | BLOCKING." ;;
-    firmware-c)
-      echo "Fresh-context EMBEDDED C/C++ FIRMWARE review. Audit FASTRUN coverage on update()/process(), heap/blocking in audio ISRs, interrupt guards, CPU-budget compliance, hardware-pin/sample-rate constants, SysEx/MIDI 7-bit constraints, OLED page wiring, ODR violations from heavy library headers. End with: ## Verdict: SHIP | MERGE-WITH-FOLLOWUPS | NEEDS-CHANGES." ;;
-    pcb)
-      echo "Fresh-context PCB/SCHEMATIC review. Audit-report freshness (re-run live audit), net-label drift, phantom components, power-rail topology, hier-pin contracts, footprint pad numbering, DRC clearance, reference-design attribution. End with: ## Verdict: SHIP | MERGE-WITH-FOLLOWUPS | NEEDS-CHANGES." ;;
-  esac
+Claude defaults to Opus at max effort. Override with XREVIEW_CLAUDE_MODEL and
+XREVIEW_CLAUDE_EFFORT. No API key is required when the selected CLI is already
+authenticated through a subscription.
+EOF
 }
-DEFAULT_PROMPT="$(load_prompt "$MODE")"
-PROMPT="${PROMPT_OVERRIDE:-$DEFAULT_PROMPT}"
 
-# ---------------------------------------------------------------------------
-# Build input file
-# ---------------------------------------------------------------------------
-DIFF_CAP="${REVIEW_DIFF_CAP:-3000}"
-{
-  echo "# Code Review Request"
-  echo
-  echo "**Timestamp:** $TS"
-  echo "**Mode:** $MODE"
-  echo "**Reviewer:** $REVIEWER"
-  echo "**Scope:** $SCOPE_LABEL"
-  echo "**Repo:** $REPO"
-  echo "**Branch:** $(git rev-parse --abbrev-ref HEAD)"
-  echo "**HEAD:** $(git rev-parse --short HEAD)"
-  echo
-  echo "## Review prompt"
-  echo
-  echo "$PROMPT"
-  echo
-  echo "## Diff (capped at $DIFF_CAP lines)"
-  echo
-  echo '```diff'
-  # No eval — `git "${DIFF_ARGS[@]}"` is shell-injection-proof regardless of
-  # how messy $SCOPE_ARG was (paths with spaces, $(cmd), backticks all inert).
-  git "${DIFF_ARGS[@]}" 2>/dev/null | head -"$DIFF_CAP" || true
-  echo '```'
-} > "$IN"
-
-if [ ! -s "$IN" ] || ! grep -q '^diff ' "$IN"; then
-  echo "No diff content for scope '$SCOPE_LABEL'. Nothing to review."
-  echo "Input file: $IN"
-  exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Resolve reviewer binary
-# ---------------------------------------------------------------------------
-if [ "$REVIEWER" = "codex" ]; then
-  if command -v codex >/dev/null 2>&1; then BIN="codex"
-  elif [ -x "$HOME/bin/codex" ]; then BIN="$HOME/bin/codex"
-  elif [ -x "/Applications/Codex.app/Contents/Resources/codex" ]; then
-    BIN="/Applications/Codex.app/Contents/Resources/codex"
-  else
-    echo "ERR: codex CLI not found. Install Codex.app or:" >&2
-    echo "  ln -s /Applications/Codex.app/Contents/Resources/codex ~/bin/codex" >&2
-    exit 3
-  fi
-  REVIEWER_CMD=("$BIN" exec -C "$REPO" -m gpt-5.5
-    -c model_reasoning_effort=xhigh -s danger-full-access)
-else
-  if command -v claude >/dev/null 2>&1; then BIN="claude"
-  else echo "ERR: claude CLI not found" >&2; exit 3; fi
-  REVIEWER_CMD=("$BIN" --effort max -p)
-fi
-
-# ---------------------------------------------------------------------------
-# Mode → two-word title + macOS Terminal.app profile
-# Title format: "<TYPE> REVIEW · <scope>" — readable at a glance in the
-# Dock and in `wmctrl` / Mission Control. Built-in modes have hardcoded
-# labels; custom modes derive a label from the mode name (e.g.
-# rust-async → "RUST-ASYNC REVIEW").
-# ---------------------------------------------------------------------------
-case "$MODE" in
-  lite)       TITLE_TYPE="LITE REVIEW";       MAC_PROFILE="Grass" ;;
-  deep)       TITLE_TYPE="DEEP REVIEW";       MAC_PROFILE="Homebrew" ;;
-  security)   TITLE_TYPE="SECURITY AUDIT";    MAC_PROFILE="Red Sands" ;;
-  firmware-c) TITLE_TYPE="FIRMWARE REVIEW";   MAC_PROFILE="Homebrew" ;;
-  pcb)        TITLE_TYPE="PCB REVIEW";        MAC_PROFILE="Pro" ;;
-  *)          TITLE_TYPE="$(echo "$MODE" | tr 'a-z' 'A-Z') REVIEW"
-              MAC_PROFILE="Basic" ;;
-esac
-TITLE="$TITLE_TYPE · $SCOPE_LABEL"
-
-ABS_IN="$IN"
-ABS_OUT="$OUT"
-RUNNER="$HANDOFF/${TS}-${MODE}-runner.sh"
-SENTINEL="$ABS_OUT.done"
-RC_FILE="$ABS_OUT.rc"
-
-# Serialise the reviewer command into the runner. Bash arrays don't survive
-# heredocs well, so expand them to a printf-quoted string here.
-REVIEWER_CMD_STR=$(printf '%q ' "${REVIEWER_CMD[@]}")
-
-cat > "$RUNNER" <<RUNNER_EOF
-#!/usr/bin/env bash
-cd "$REPO"
-# OSC 0 — set window+icon title (universal across modern terminals)
-printf '\033]0;%s\007' "$TITLE"
-PROMPT="\$(cat '$ABS_IN')"
-$REVIEWER_CMD_STR "\$PROMPT" 2>&1 | tee '$ABS_OUT'
-RC=\${PIPESTATUS[0]}
-# Persist the reviewer's exit code so the parent can propagate it.
-# The sentinel is created LAST so the parent never reads a partial RC file.
-echo "\$RC" > '$RC_FILE'
-echo
-echo "=== Reviewer exited (\$RC). Press any key to close. ==="
-touch '$SENTINEL'
-read -n 1
-RUNNER_EOF
-chmod +x "$RUNNER" || { echo "ERR: chmod on $RUNNER failed" >&2; exit 4; }
-
-echo "=== xreview handoff ==="
-echo "Reviewer: $REVIEWER ($BIN)"
-echo "Scope:    $SCOPE_LABEL"
-echo "Mode:     $MODE"
-echo "Input:    $IN"
-echo "Output:   $OUT"
-echo
-
-# ---------------------------------------------------------------------------
-# Platform-specific spawn
-# ---------------------------------------------------------------------------
-spawn_terminal() {
-  local runner="$1"
-  case "$(uname -s)" in
-    Darwin)
-      if ! osascript >/dev/null 2>&1 <<APPLESCRIPT
-tell application "Terminal"
-  activate
-  do script "$runner"
-  set custom title of front window to "$TITLE"
-  try
-    set current settings of front window to settings set "$MAC_PROFILE"
-  end try
-end tell
-APPLESCRIPT
-      then echo "ERR: osascript spawn failed" >&2; return 1; fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
       ;;
-    Linux)
-      if   command -v gnome-terminal >/dev/null 2>&1; then
-        gnome-terminal --title="$TITLE" -- bash -c "$runner; exec bash" &
-      elif command -v konsole >/dev/null 2>&1; then
-        konsole --new-tab -p "tabtitle=$TITLE" -e bash -c "$runner; exec bash" &
-      elif command -v wezterm >/dev/null 2>&1; then
-        wezterm cli spawn --new-window -- bash -c "$runner" &
-      elif command -v kitty >/dev/null 2>&1; then
-        kitty --title "$TITLE" bash -c "$runner; exec bash" &
-      elif command -v alacritty >/dev/null 2>&1; then
-        alacritty --title "$TITLE" -e bash -c "$runner" &
-      elif command -v xterm >/dev/null 2>&1; then
-        xterm -T "$TITLE" -e bash -c "$runner; exec bash" &
-      elif [ -n "${TMUX:-}" ]; then
-        tmux new-window -n "$TITLE" "bash -c '$runner'"
-      else
-        echo "WARN: no GUI terminal found; running inline" >&2
-        bash "$runner"
+    -v|--version)
+      echo "xreview 2.0.0"
+      exit 0
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --headless)
+      headless=1
+      shift
+      ;;
+    --mechanical|--test-contract|--tests)
+      mechanical=1
+      shift
+      ;;
+    --staged|--working)
+      passthrough+=("$1")
+      shift
+      ;;
+    --mode)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "xreview: --mode needs a value." >&2
+        exit 2
+      fi
+      mode="$2"
+      passthrough+=("$1" "$2")
+      shift 2
+      ;;
+    --mode=*)
+      mode="${1#--mode=}"
+      if [[ -z "$mode" ]]; then
+        echo "xreview: --mode needs a value." >&2
+        exit 2
+      fi
+      passthrough+=("$1")
+      shift
+      ;;
+    --scope)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "xreview: --scope needs a value." >&2
+        exit 2
+      fi
+      scope="$2"
+      passthrough+=("$1" "$2")
+      shift 2
+      ;;
+    --scope=*)
+      scope="${1#--scope=}"
+      if [[ -z "$scope" ]]; then
+        echo "xreview: --scope needs a value." >&2
+        exit 2
+      fi
+      passthrough+=("$1")
+      shift
+      ;;
+    --pr)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "xreview: --pr needs a value." >&2
+        exit 2
+      fi
+      pr="$2"
+      passthrough+=("$1" "$2")
+      shift 2
+      ;;
+    --pr=*)
+      pr="${1#--pr=}"
+      if [[ -z "$pr" ]]; then
+        echo "xreview: --pr needs a value." >&2
+        exit 2
+      fi
+      passthrough+=("$1")
+      shift
+      ;;
+    pr:*)
+      pr="${1#pr:}"
+      if [[ -z "$pr" ]]; then
+        echo "xreview: pr: needs a value." >&2
+        exit 2
+      fi
+      passthrough+=("$1")
+      shift
+      ;;
+    --*)
+      echo "xreview: unknown option '$1'." >&2
+      exit 2
+      ;;
+    *)
+      passthrough+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if ! [[ "$mode" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]; then
+  echo "xreview: mode must be a 1-32 character name using letters, digits, dot, underscore, or dash." >&2
+  exit 2
+fi
+if ! [[ "$CLAUDE_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+  echo "xreview: XREVIEW_CLAUDE_MODEL contains unsupported characters." >&2
+  exit 2
+fi
+case "$CLAUDE_EFFORT" in
+  low|medium|high|xhigh|max) ;;
+  *)
+    echo "xreview: XREVIEW_CLAUDE_EFFORT must be low, medium, high, xhigh, or max." >&2
+    exit 2
+    ;;
+esac
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$repo_root" ]]; then
+  echo "xreview: run from inside a git repository." >&2
+  exit 1
+fi
+
+cd "$repo_root"
+
+if [[ -n "${XREVIEW_SKILL_PATH:-}" ]]; then
+  skill_path="$XREVIEW_SKILL_PATH"
+elif [[ -f "$repo_root/.agents/skills/xreview/SKILL.md" ]]; then
+  skill_path="$repo_root/.agents/skills/xreview/SKILL.md"
+elif [[ -f "$repo_root/.claude/skills/xreview/SKILL.md" ]]; then
+  skill_path="$repo_root/.claude/skills/xreview/SKILL.md"
+elif [[ -f "$repo_root/.codex/skills/xreview/SKILL.md" ]]; then
+  skill_path="$repo_root/.codex/skills/xreview/SKILL.md"
+elif [[ -f "$BUNDLED_SKILL_PATH" ]]; then
+  skill_path="$BUNDLED_SKILL_PATH"
+else
+  skill_path="$GLOBAL_SKILL_PATH"
+fi
+
+if [[ ! -f "$skill_path" ]]; then
+  echo "xreview: skill not found at $skill_path" >&2
+  exit 1
+fi
+
+join_shell_quoted() {
+  local result=""
+  local item
+  local encoded
+  for item in "$@"; do
+    printf -v encoded '%q' "$item"
+    result="${result}${result:+ }${encoded}"
+  done
+  printf '%s' "$result"
+}
+
+args_text="<none>"
+if [[ -n "${passthrough[*]-}" ]]; then
+  args_text="$(join_shell_quoted "${passthrough[@]}")"
+fi
+declare -a scope_args=()
+for ((i = 0; i < ${#passthrough[@]}; i++)); do
+  arg="${passthrough[$i]}"
+  case "$arg" in
+    --mode|--scope|--pr)
+      i=$((i + 1))
+      ;;
+    --mode=*|--scope=*|--pr=*|pr:*)
+      ;;
+    *)
+      scope_args+=("$arg")
+      ;;
+  esac
+done
+
+scope_text=""
+if [[ -n "${scope_args[*]-}" ]]; then
+  scope_text="$(join_shell_quoted "${scope_args[@]}")"
+fi
+if [[ -z "$scope_text" ]]; then
+  if [[ -n "$(git status --porcelain)" ]]; then
+    scope_text="dirty working tree"
+  else
+    scope_text="HEAD"
+  fi
+fi
+
+if [[ -n "$pr" ]]; then
+  scope_text="PR $(join_shell_quoted "$pr")"
+fi
+
+first_scope_arg="${scope_args[0]:-}"
+scope_display="$(LC_ALL=C printf '%s' "$scope_text" | LC_ALL=C tr -cd '[:print:]')"
+scope_title="$scope_display"
+if [[ -n "$scope" ]]; then
+  scope_title="checking $scope"
+elif [[ -n "$pr" ]]; then
+  scope_title="checking PR $pr"
+elif [[ -z "${scope_args[*]:-}" ]]; then
+  scope_title="checking $scope_text"
+else
+  case "$first_scope_arg" in
+    --staged)
+      scope_title="checking staged changes"
+      ;;
+    --working)
+      scope_title="checking working tree"
+      ;;
+    *..*)
+      scope_title="checking commits $first_scope_arg"
+      ;;
+    HEAD|head)
+      scope_title="checking HEAD"
+      ;;
+    *)
+      scope_title="checking $first_scope_arg"
+      ;;
+  esac
+fi
+
+engine_explicit=0
+scope_needs_claude=0
+scope_claude_reason=""
+
+has_staged=0
+has_working=0
+scope_count=0
+if [[ -n "${scope_args[*]-}" ]]; then
+  scope_count=${#scope_args[@]}
+  for arg in "${scope_args[@]}"; do
+    [[ "$arg" == "--staged" ]] && has_staged=1
+    [[ "$arg" == "--working" ]] && has_working=1
+  done
+fi
+if [[ "$has_staged" -eq 1 && "$has_working" -eq 1 ]]; then
+  echo "xreview: choose either --staged or --working, not both." >&2
+  exit 2
+fi
+
+if [[ "$dry_run" -eq 0 && "$scope_count" -eq 1 ]]; then
+  case "$first_scope_arg" in
+    --staged)
+      if git diff --cached --quiet; then
+        echo "xreview: staged scope has no diff; nothing to review."
+        exit 0
       fi
       ;;
-    MINGW*|MSYS*|CYGWIN*)
-      if command -v wt.exe >/dev/null 2>&1; then
-        wt.exe new-tab --title "$TITLE" bash -c "$runner; exec bash" &
-      elif command -v cmd.exe >/dev/null 2>&1; then
-        cmd.exe /c start "$TITLE" bash -c "$runner; pause" &
-      else
-        echo "WARN: no Windows terminal launcher found; running inline" >&2
-        bash "$runner"
+    --working)
+      if git diff --quiet; then
+        echo "xreview: working scope has no diff; nothing to review."
+        exit 0
+      fi
+      ;;
+    *..*)
+      if git diff --quiet "$first_scope_arg" 2>/dev/null; then
+        echo "xreview: range $first_scope_arg has no diff; nothing to review."
+        exit 0
       fi
       ;;
     *)
-      echo "WARN: unknown platform $(uname -s); running inline" >&2
-      bash "$runner"
+      if [[ -n "$first_scope_arg" && "$first_scope_arg" != --* ]] && \
+          ! git rev-parse --verify --quiet "${first_scope_arg}^{commit}" >/dev/null 2>&1 && \
+          git diff --quiet HEAD -- "$first_scope_arg" 2>/dev/null && \
+          [[ -z "$(git ls-files --others --exclude-standard -- "$first_scope_arg")" ]]; then
+        echo "xreview: path $scope_display has no diff; nothing to review."
+        exit 0
+      fi
       ;;
   esac
-}
+fi
 
-spawn_terminal "$RUNNER" || {
-  echo "ERR: terminal spawn failed. Manually run: bash $RUNNER" >&2
-  exit 5
-}
+if [[ "$mechanical" -eq 1 ]]; then
+  scope_needs_claude=1
+  scope_claude_reason="mechanical reviews use the Claude test-contract prompt"
+elif [[ -n "$pr" ]]; then
+  scope_needs_claude=1
+  scope_claude_reason="pull-request review needs exact gh-based scope resolution"
+elif [[ "$first_scope_arg" == "--staged" || "$first_scope_arg" == "--working" ]]; then
+  scope_needs_claude=1
+  scope_claude_reason="$first_scope_arg needs an exact diff rather than Codex's combined --uncommitted scope"
+elif [[ "$scope_count" -gt 1 ]]; then
+  scope_needs_claude=1
+  scope_claude_reason="combined revision and path scopes need exact filtering"
+elif [[ "$first_scope_arg" == *..* ]]; then
+  scope_needs_claude=1
+  scope_claude_reason="commit ranges need exact two-revision resolution"
+elif [[ -n "$first_scope_arg" && "$first_scope_arg" != --* ]] && \
+     ! git rev-parse --verify --quiet "${first_scope_arg}^{commit}" >/dev/null 2>&1; then
+  scope_needs_claude=1
+  scope_claude_reason="path-limited review is not exposed by codex review"
+fi
 
-echo "Reviewer spawned. Title: $TITLE"
-echo "Polling sentinel: $SENTINEL"
+if [[ -n "${XREVIEW_ENGINE:-}" ]]; then
+  ENGINE="$XREVIEW_ENGINE"
+  engine_explicit=1
+elif [[ -n "${CODEX_SHELL:-}" || -n "${CODEX_THREAD_ID:-}" ]]; then
+  ENGINE="claude"
+elif [[ "$scope_needs_claude" -eq 1 ]]; then
+  ENGINE="claude"
+else
+  ENGINE="codex"
+fi
 
-# ---------------------------------------------------------------------------
-# Wait for completion
-# ---------------------------------------------------------------------------
-case "$MODE" in
-  lite)        TIMEOUT_SEC=1200 ;;   # 20 min
-  deep)        TIMEOUT_SEC=3000 ;;   # 50 min
-  security)    TIMEOUT_SEC=2400 ;;   # 40 min
-  firmware-c)  TIMEOUT_SEC=3000 ;;   # 50 min — pio audits can be slow
-  pcb)         TIMEOUT_SEC=2400 ;;   # 40 min
-  *)           TIMEOUT_SEC=2400 ;;   # custom-mode default
+case "$ENGINE" in
+  claude|codex) ;;
+  *)
+    echo "xreview: XREVIEW_ENGINE must be 'claude' or 'codex'." >&2
+    exit 2
+    ;;
 esac
 
-WAITED=0
-while [ ! -f "$SENTINEL" ]; do
-  sleep 5
-  WAITED=$((WAITED + 5))
-  if [ -s "$OUT" ]; then
-    LINES=$(wc -l < "$OUT" | tr -d ' ')
-    echo "  [${WAITED}s] $LINES lines so far..."
-  fi
-  if [ "$WAITED" -gt "$TIMEOUT_SEC" ]; then
-    echo "ERR: timeout after $((TIMEOUT_SEC/60)) min" >&2
-    echo "      Runner: $RUNNER" >&2
-    echo "      Output: $OUT" >&2
-    exit 6
-  fi
-done
-rm -f "$SENTINEL"
-
-# Read reviewer RC. Missing RC file = abnormal exit (terminal closed
-# before runner finished writing). Non-zero RC = reviewer crashed or
-# was killed.
-REVIEWER_RC=0
-if [ -r "$RC_FILE" ]; then
-  REVIEWER_RC="$(cat "$RC_FILE" 2>/dev/null || echo 1)"
-  rm -f "$RC_FILE"
-else
-  echo "WARN: reviewer RC file missing — treating as failure" >&2
-  REVIEWER_RC=1
+if [[ "$ENGINE" == "codex" && "$scope_needs_claude" -eq 1 ]]; then
+  echo "xreview: this scope requires Claude: $scope_claude_reason." >&2
+  echo "xreview: unset XREVIEW_ENGINE or use XREVIEW_ENGINE=claude." >&2
+  exit 2
 fi
+
+if [[ -n "$pr" && "$dry_run" -eq 0 ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "xreview: --pr requires the GitHub CLI (gh)." >&2
+    exit 127
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "xreview: --pr requires an authenticated GitHub CLI; run 'gh auth login'." >&2
+    exit 1
+  fi
+fi
+
+# Codex sessions prefer Claude for an independent review, but a missing or
+# logged-out Claude installation should not turn an ordinary review into a
+# silent no-op. Fall back to the authenticated Codex reviewer unless the task
+# is Claude-only (`--mechanical`) or the caller explicitly requires Claude.
+if [[ "$ENGINE" == "claude" && "$dry_run" -eq 0 ]]; then
+  claude_unavailable_reason=""
+  if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+    claude_unavailable_reason="Claude binary not found"
+  else
+    claude_auth_status="$("$CLAUDE_BIN" auth status 2>/dev/null || true)"
+    if ! grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true' <<<"$claude_auth_status"; then
+      claude_unavailable_reason="Claude is not logged in"
+    fi
+  fi
+
+  if [[ -n "$claude_unavailable_reason" ]]; then
+    if [[ "$mechanical" -eq 0 && "$engine_explicit" -eq 0 && "$scope_needs_claude" -eq 0 && \
+          "${XREVIEW_REQUIRE_CLAUDE:-0}" != "1" ]] && command -v codex >/dev/null 2>&1; then
+      echo "xreview: $claude_unavailable_reason; falling back to the Codex reviewer." >&2
+      if [[ "$claude_unavailable_reason" == "Claude binary not found" ]]; then
+        echo "xreview: install Claude Code to restore cross-agent reviews." >&2
+      else
+        echo "xreview: run 'claude auth login' to restore cross-agent reviews." >&2
+      fi
+      ENGINE="codex"
+    else
+      echo "xreview: $claude_unavailable_reason." >&2
+      if [[ "$claude_unavailable_reason" == "Claude binary not found" ]]; then
+        echo "xreview: install Claude Code before this Claude-only review." >&2
+      else
+        echo "xreview: run 'claude auth login' before this Claude-only review." >&2
+      fi
+      exit 1
+    fi
+  fi
+fi
+
+if [[ "$ENGINE" == "codex" && "$dry_run" -eq 0 ]] && ! command -v codex >/dev/null 2>&1; then
+  echo "xreview: codex not found (set XREVIEW_ENGINE=claude for the Claude reviewer)." >&2
+  exit 127
+fi
+
+if [[ "$mechanical" -eq 1 ]]; then
+  review_kind="mechanical test reviewer"
+else
+  review_kind="reviewer"
+fi
+
+if [[ "$dry_run" -eq 1 ]]; then
+  action="dry-run: would spawn terminal-backed ${ENGINE} ${review_kind}"
+else
+  action="spawning terminal-backed ${ENGINE} ${review_kind}"
+fi
+
+# Tee every review's output to a predictable log file so the result is easy to
+# re-check after the window closes. Include a path hash so same-named checkouts
+# do not overwrite each other.
+repo_path_hash() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$repo_root" | LC_ALL=C shasum -a 256 | cut -c1-10
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$repo_root" | LC_ALL=C sha256sum | cut -c1-10
+  else
+    printf '%s' "$repo_root" | cksum | awk '{print $1}'
+  fi
+}
+
+log_dir="${XREVIEW_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/xreview}"
+log_stem="$(basename "$repo_root")-$(repo_path_hash)"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+log_name="${log_stem}-${run_id}.log"
+latest_name="${log_stem}-latest.log"
+log_file="$log_dir/$log_name"
+if [[ "$dry_run" -eq 0 ]]; then
+  if ! { mkdir -p "$log_dir" && : > "$log_file"; } 2>/dev/null; then
+    log_dir="${TMPDIR:-/tmp}/xreview"
+    mkdir -p "$log_dir"
+    log_file="$log_dir/$log_name"
+    : > "$log_file"
+    echo "xreview: configured log directory is not writable; using $log_dir." >&2
+  fi
+  latest_file="$log_dir/$latest_name"
+  ln -sfn "$log_file" "$latest_file" 2>/dev/null || true
+  done_file="${log_file}.done"
+  rm -f "$done_file"
+else
+  latest_file="$log_dir/$latest_name"
+  done_file="${log_file}.done"
+fi
+
+cat >&2 <<EOF
+xreview: $action
+repo: $repo_root
+skill: $skill_path
+scope: $scope_display
+mode: $mode
+mechanical: $mechanical
+log: $log_file
+done: $done_file
+latest: $latest_file
+EOF
+
+if [[ "$ENGINE" == "claude" ]]; then
+  cat >&2 <<EOF
+model: $CLAUDE_MODEL
+effort: $CLAUDE_EFFORT
+EOF
+fi
+
+IFS= read -r -d '' codex_prompt <<EOF || true
+Use the xreview skill at $skill_path.
+
+Repository: $repo_root
+Raw arguments: $args_text
+Resolved scope: $scope_text
+Mode: $mode
+Scope label: ${scope:-<none>}
+
+Run one fresh, read-only review. The Codex review command has already pinned the
+Git scope. Read the skill and repository instructions, apply the requested mode
+and scope label, inspect surrounding source for every finding, and report only
+high-confidence actionable issues. Findings come first; include residual risk
+or tests not run. Do not edit files or mutate Git state.
+EOF
+
+spawn_runner() {
+  local runner_path="$1"
+  case "$(uname -s)" in
+    Darwin)
+      if command -v osascript >/dev/null 2>&1 && \
+          XREVIEW_RUNNER="$runner_path" osascript >/dev/null 2>&1 <<'APPLESCRIPT'
+set runnerPath to system attribute "XREVIEW_RUNNER"
+tell application "Terminal"
+  activate
+  do script "bash " & quoted form of runnerPath
+end tell
+APPLESCRIPT
+      then
+        return 0
+      fi
+      ;;
+    Linux)
+      if command -v gnome-terminal >/dev/null 2>&1; then
+        gnome-terminal -- bash "$runner_path" &
+      elif command -v konsole >/dev/null 2>&1; then
+        konsole --new-tab -e bash "$runner_path" &
+      elif command -v wezterm >/dev/null 2>&1; then
+        wezterm start -- bash "$runner_path" &
+      elif command -v kitty >/dev/null 2>&1; then
+        kitty bash "$runner_path" &
+      elif command -v xterm >/dev/null 2>&1; then
+        xterm -e bash "$runner_path" &
+      elif [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+        tmux new-window -n xreview bash "$runner_path"
+      else
+        return 1
+      fi
+      return 0
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      if command -v wt.exe >/dev/null 2>&1; then
+        wt.exe new-tab bash "$runner_path" &
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
 
 # ---------------------------------------------------------------------------
-# Surface verdict + propagate failure
+# Engine dispatch. Default opens a VISIBLE Terminal window so the session can
+# be watched live. `--headless` runs inline when the caller wants captured
+# output instead of an external window.
 # ---------------------------------------------------------------------------
-echo
-echo "=== $REVIEWER review ($MODE) ==="
-if grep -q '^## Verdict' "$OUT"; then
-  awk '/^## Verdict/,EOF' "$OUT"
-  HAS_VERDICT=1
-else
-  tail -200 "$OUT"
-  HAS_VERDICT=0
-fi
-echo
-echo "=== Full review: $OUT ==="
-echo "Reviewer exit code: $REVIEWER_RC"
+if [[ "$ENGINE" == "codex" ]]; then
+  # Map the resolved scope onto `codex review` flags.
+  declare -a review_args=(review)
+  first="${scope_args[0]:-}"
+  if [[ -z "$first" ]]; then
+    if [[ -n "$(git status --porcelain)" ]]; then
+      review_args+=(--uncommitted)
+    else
+      review_args+=(--commit HEAD)
+    fi
+  else
+    review_args+=(--commit "$first")
+  fi
 
-# Exit code policy — caller (hook / CI) needs to know when the review
-# failed to produce a verdict OR the reviewer itself crashed. Pre-commit
-# hooks rely on this; without it the hook treats a crash as "passed".
-if [ "$REVIEWER_RC" -ne 0 ]; then
-  echo "ERR: reviewer exited non-zero ($REVIEWER_RC)" >&2
-  exit 7
+  if [[ "$dry_run" -eq 1 ]]; then
+    echo "xreview: would run -> codex ${review_args[*]} <xreview-prompt>" >&2
+    exit 0
+  fi
+
+  # --headless: run codex review in-process (no window) so the caller captures
+  # the output. Default (no flag) spawns a visible Terminal window below.
+  if [[ "$headless" -eq 1 ]]; then
+    echo "xreview: running codex ${review_args[*]} headless (log: $log_file)." >&2
+    set +e
+    codex "${review_args[@]}" "$codex_prompt" 2>&1 | tee "$log_file"
+    status="${PIPESTATUS[0]}"
+    set -e
+    printf '%s\n' "$status" > "$done_file"
+    exit "$status"
+  fi
+
+  # A tiny runner avoids fragile AppleScript quoting for the cd + codex command.
+  runner="$(mktemp "${TMPDIR:-/tmp}/xreview_codex.XXXXXX")"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'status=1\n'
+    printf 'mark_done() { printf "%%s\\n" "$status" > %q; }\n' "$done_file"
+    printf 'trap mark_done EXIT\n'
+    printf 'cd %q || exit 1\n' "$repo_root"
+    printf 'printf "%%s\\n" %q\n' "== xreview (codex) | scope: $scope_display | mode: $mode =="
+    printf 'codex'
+    printf ' %q' "${review_args[@]}" "$codex_prompt"
+    printf ' 2>&1 | tee %q\n' "$log_file"
+    printf 'status=${PIPESTATUS[0]}\n'
+    printf 'echo; echo "== codex review finished (exit $status). =="\n'
+    printf 'printf "%%s\\n" %q\n' "xreview: full output saved to $log_file"
+    printf 'rm -f %q\n' "$runner"
+    printf 'exit "$status"\n'
+  } > "$runner"
+  chmod +x "$runner"
+
+  if spawn_runner "$runner"; then
+    echo "xreview: opened a terminal running 'codex ${review_args[*]}' (scope: $scope_display, mode: $mode)." >&2
+    exit 0
+  fi
+  echo "xreview: no supported visible terminal found; running codex inline." >&2
+  exec bash "$runner"
 fi
-if [ "$HAS_VERDICT" -eq 0 ]; then
-  echo "ERR: reviewer produced no '## Verdict' section — incomplete review" >&2
-  exit 7
+
+if [[ "$dry_run" -eq 1 ]]; then
+  exit 0
 fi
-exit 0
+
+if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+  echo "xreview: claude binary not found. Set CLAUDE_BIN or add claude to PATH." >&2
+  exit 127
+fi
+CLAUDE_CMD="$(command -v "$CLAUDE_BIN")"
+
+# NOTE: read the heredoc into a var instead of prompt="$(cat <<EOF ...)".
+# macOS ships bash 3.2, which mis-parses heredocs nested in $() command
+# substitution (apostrophes in the body trigger "unexpected EOF"). Slurping
+# via `read -r -d ''` is a plain heredoc that bash 3.2 handles correctly.
+if [[ "$mechanical" -eq 1 ]]; then
+  IFS= read -r -d '' prompt <<EOF || true
+Use the xreview skill at $skill_path.
+
+Repository: $repo_root
+Raw arguments: ${args_text:-<none>}
+Resolved initial scope hint: $scope_text
+Mode: $mode
+Scope label: ${scope:-<none>}
+
+Run the skill's read-only Mechanical Test Contract workflow in a fresh single
+reviewer session. Resolve the exact target from the raw arguments, read project
+instructions and the nearest test harnesses, and return the skill's prescribed
+mechanical output. Do not edit files, run proof commands, or mutate Git state.
+EOF
+else
+  IFS= read -r -d '' prompt <<EOF || true
+Use the xreview skill at $skill_path.
+
+Repository: $repo_root
+Raw arguments: ${args_text:-<none>}
+Resolved initial scope hint: $scope_text
+Mode: $mode
+Scope label: ${scope:-<none>}
+
+Run the skill's read-only xreview workflow in a fresh single-reviewer session.
+Resolve the exact target from the raw arguments, read project instructions,
+inspect surrounding source, and return only high-confidence actionable
+findings plus residual risk. Do not edit files or mutate Git state.
+EOF
+fi
+
+if [[ "$headless" -eq 1 ]]; then
+  if [[ "$mechanical" -eq 1 ]]; then
+    echo "xreview: running claude mechanical test reviewer headless (log: $log_file)." >&2
+  else
+    echo "xreview: running claude reviewer headless (log: $log_file)." >&2
+  fi
+  set +e
+  "$CLAUDE_CMD" -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" \
+    --disallowedTools "$CLAUDE_DISALLOWED_TOOLS" --permission-mode plan \
+    "$prompt" 2>&1 | tee "$log_file"
+  status="${PIPESTATUS[0]}"
+  set -e
+  printf '%s\n' "$status" > "$done_file"
+  exit "$status"
+fi
+
+case "$mode" in
+  lite|light)
+    title_mode="LITE"
+    title_color="#102C42"
+    text_color="#E8F5FF"
+    ;;
+  mid)
+    title_mode="MID"
+    title_color="#12351E"
+    text_color="#E6FFE9"
+    ;;
+  deep)
+    title_mode="DEEP"
+    title_color="#071735"
+    text_color="#BDF8FF"
+    ;;
+  security)
+    title_mode="SECURITY"
+    title_color="#3A1115"
+    text_color="#FFE8EA"
+    ;;
+  docs)
+    title_mode="DOCS"
+    title_color="#102C42"
+    text_color="#E8F5FF"
+    ;;
+  *)
+    title_mode="$(printf '%s' "$mode" | tr '[:lower:]' '[:upper:]')"
+    title_color="#252525"
+    text_color="#F0F0F0"
+    ;;
+esac
+
+scope_title="$(LC_ALL=C printf '%s' "$scope_title" | LC_ALL=C tr -cd '[:print:]')"
+if [[ ${#scope_title} -gt 56 ]]; then
+  scope_title="${scope_title:0:53}..."
+fi
+if [[ "$mechanical" -eq 1 ]]; then
+  window_title="Claude mechanical ${title_mode}: ${scope_title}"
+else
+  window_title="Claude xreview ${title_mode}: ${scope_title}"
+fi
+
+prompt_file="$(mktemp "${TMPDIR:-/tmp}/xreview_claude_prompt.XXXXXX")"
+runner="$(mktemp "${TMPDIR:-/tmp}/xreview_claude.XXXXXX")"
+printf '%s' "$prompt" > "$prompt_file"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'set -euo pipefail\n'
+  printf 'status=1\n'
+  printf 'mark_done() { printf "%%s\\n" "$status" > %q; }\n' "$done_file"
+  printf 'trap mark_done EXIT\n'
+  printf 'cd %q || exit 1\n' "$repo_root"
+  printf 'printf "\\033]0;%%s\\007" %q\n' "$window_title"
+  printf 'printf "\\033]10;%%s\\007" %q\n' "$text_color"
+  printf 'printf "\\033]11;%%s\\007" %q\n' "$title_color"
+  if [[ "$mechanical" -eq 1 ]]; then
+    printf 'printf "%%s\\n" %q\n' "== mechanical test review (claude) | mode: $mode | scope: $scope_display =="
+  else
+    printf 'printf "%%s\\n" %q\n' "== xreview (claude) | mode: $mode | scope: $scope_display =="
+  fi
+  printf 'echo "xreview: claude -p is running; this window may stay quiet until the final report."\n'
+  printf 'echo "xreview: heartbeat every 30s so a slow review does not look dead."\n'
+  printf 'prompt="$(cat %q)"\n' "$prompt_file"
+  printf '(\n'
+  if [[ "$mechanical" -eq 1 ]]; then
+    printf '  while true; do sleep 30; echo "xreview: still waiting for claude mechanical test reviewer... ($(date +%%H:%%M:%%S))"; done\n'
+  else
+    printf '  while true; do sleep 30; echo "xreview: still waiting for claude reviewer... ($(date +%%H:%%M:%%S))"; done\n'
+  fi
+  printf ') &\n'
+  printf 'heartbeat_pid=$!\n'
+  printf 'cleanup_heartbeat() { kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true; }\n'
+  printf 'trap "cleanup_heartbeat; mark_done" EXIT\n'
+  printf 'set +e\n'
+  printf '%q -p --model %q --effort %q --disallowedTools %q --permission-mode plan "$prompt" 2>&1 | tee %q\n' "$CLAUDE_CMD" "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_DISALLOWED_TOOLS" "$log_file"
+  printf 'status=${PIPESTATUS[0]}\n'
+  printf 'set -e\n'
+  printf 'cleanup_heartbeat\n'
+  if [[ "$mechanical" -eq 1 ]]; then
+    printf 'echo; echo "== claude mechanical test review finished (exit $status). =="\n'
+  else
+    printf 'echo; echo "== claude xreview finished (exit $status). =="\n'
+  fi
+  printf 'printf "%%s\\n" %q\n' "xreview: full output saved to $log_file"
+  printf 'rm -f %q %q\n' "$prompt_file" "$runner"
+  printf 'exit "$status"\n'
+} > "$runner"
+chmod +x "$runner"
+
+if spawn_runner "$runner"; then
+  if [[ "$mechanical" -eq 1 ]]; then
+    echo "xreview: opened a terminal running claude mechanical test reviewer (scope: $scope_display, mode: $mode)." >&2
+  else
+    echo "xreview: opened a terminal running claude reviewer (scope: $scope_display, mode: $mode)." >&2
+  fi
+  exit 0
+fi
+
+echo "xreview: no supported visible terminal found; running claude inline." >&2
+
+exec bash "$runner"
